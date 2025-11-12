@@ -1,0 +1,61 @@
+# --- General ---
+.DS_Store
+Thumbs.db
+*.log
+*.tmp
+*.bak
+*.swp
+*.env
+.env.local
+.env.*.local
+
+# --- Node / Backend ---
+backend/node_modules/
+backend/package-lock.json
+backend/evosolve.db
+backend/.env
+
+# --- Python / Flask (if used) ---
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.db
+*.sqlite3
+instance/
+.env
+.venv/
+venv/
+env/
+*.egg-info/
+*.egg
+
+# --- React Frontend ---
+evo-frontend/node_modules/
+evo-frontend/build/
+evo-frontend/.env
+evo-frontend/.env.local
+evo-frontend/package-lock.json
+
+# --- Editor / IDE ---
+.vscode/
+.idea/
+*.code-workspace
+
+# --- OS Specific ---
+# macOS
+.AppleDouble
+.LSOverride
+Icon?
+._*
+
+# Windows
+ehthumbs.db
+Desktop.ini
+
+# --- Logs ---
+logs/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
