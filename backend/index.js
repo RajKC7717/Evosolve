@@ -12,6 +12,9 @@ const multer = require('multer');
 const csv = require('csv-parser');
 const axios = require('axios');
 const { Readable } = require('stream');
+const path = require('path'); // New: For file paths
+const fs = require('fs'); // New: For saving temp files
+const { python } = require('node-calls-python'); // New: For calling Python
 
 // --- 2. Configuration & Secrets ---
 
@@ -31,6 +34,8 @@ if (!GEMINI_API_KEY || !MONGO_URI || !JWT_SECRET) {
 const GEMINI_API_URL = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-09-2025:generateContent?key=${GEMINI_API_KEY}`;
 
 // --- 3. Mongoose (MongoDB) Database Setup ---
+
+// ... (This section is unchanged, so it is omitted for brevity) ...
 
 // Define Mongoose Schemas (replaces Sequelize models)
 const UserSchema = new mongoose.Schema({
@@ -75,19 +80,21 @@ const AnalysisResultSchema = new mongoose.Schema({
 const User = mongoose.model('User', UserSchema);
 const AnalysisResult = mongoose.model('AnalysisResult', AnalysisResultSchema);
 
+
 // --- 4. Express App & Middleware ---
 
+// ... (This section is unchanged, so it is omitted for brevity) ...
 const app = express();
 const upload = multer({ storage: multer.memoryStorage() });
 
 app.use(cors({ origin: 'http://localhost:3000' }));
 app.use(express.json()); // for parsing application/json
 
+
 // --- 5. Authentication Functions (Middleware & Helpers) ---
 
+// ... (This section is unchanged, so it is omitted for brevity) ...
 // Password Hashing (Mongoose-style, using bcryptjs)
-// We'll add this as a "pre-save hook" to the UserSchema
-// This automatically hashes the password *before* it's saved
 UserSchema.pre('save', async function(next) {
   if (!this.isModified('password')) {
     return next();
@@ -124,8 +131,10 @@ const authenticateUser = (req, res, next) => {
   }
 };
 
+
 // --- 6. Auth API Endpoints (Rewritten for Mongoose) ---
 
+// ... (This section is unchanged, so it is omitted for brevity) ...
 app.get("/", (req, res) => {
   res.send("Evosolve JS backend (MongoDB Version) is running!");
 });
@@ -207,54 +216,46 @@ app.get('/me', authenticateUser, async (req, res) => {
   }
 });
 
-// --- 7. LLM Helper Function (Now uses the API Key) ---
+
+// --- 7. LLM Helper Function (MODIFIED) ---
 
 /**
- * Calls the Gemini API to get a formula for the given data.
- * @param {string} dataSample - A CSV string sample of the data.
- * @param {string[]} inputCols - List of input column names.
- * @param {string} outputCol - The target output column name.
- * @param {boolean} simpleMode - If true, restricts the LLM to basic math.
- * @returns {Promise<{formula: string, accuracy: number}>}
+ * Calls the Gemini API to get a *tool suggestion* for the GP.
+ * This function now implements the "Expert Collaborator" logic[cite: 95].
+ * @param {string} failedFormula - The bloated formula from the "simple" GP run.
+ * @param {string[]} activeOperators - The list of operators that *failed*.
+ * @param {string[]} lockedOperators - The list of available new tools.
+ * @returns {Promise<string>} - The name of the tool to add (e.g., "sqrt") or "None".
  */
-const callGeminiForFormula = async (dataSample, inputCols, outputCol, simpleMode) => {
+const callGeminiForToolSuggestion = async (failedFormula, activeOperators, lockedOperators) => {
   // Define the JSON schema we want the LLM to return
   const json_schema = {
     type: "OBJECT",
     properties: {
-      "formula": {
+      "tool_suggestion": {
         "type": "STRING",
-        "description": "The mathematical formula, e.g., 'add(mul(a, 2), b)' or 'a * 2 + b'"
+        "description": `The single best tool from the LOCKED_OPERATORS list to add. Must be one of ${lockedOperators.join(', ')} or 'None'.`
       },
-      "accuracy_r_squared": {
-        "type": "NUMBER",
-        "description": "The R-squared accuracy of the formula, from 0.0 to 1.0"
+      "reasoning": {
+        "type": "STRING",
+        "description": "A brief explanation for the choice."
       }
     }
   };
 
-  // Define the constraints for the LLM based on simpleMode
-  let function_constraint = "You may only use basic arithmetic operators: add, sub, mul, div.";
-  if (!simpleMode) {
-    function_constraint = "You are encouraged to use more complex functions if they improve accuracy, such as: sqrt, log, sin, cos, exp.";
-  }
-
   const prompt = `
-    You are an expert data scientist performing symbolic regression.
-    Your task is to find the simplest, most accurate mathematical formula that
-    predicts the output column '${outputCol}' from the input columns: ${inputCols}.
+    You are an expert mathematician acting as a collaborator for a Genetic Programming (GP) algorithm.
+    The GP algorithm is "stuck"[cite: 96, 97]. It tried to find a formula using only the operators [${activeOperators.join(', ')}] but produced a bloated, inaccurate formula:
+    
+    Failed Formula: ${failedFormula}
 
-    Here is a sample of the data (in CSV format):
-    ${dataSample}
+    Your task is to suggest ONE new, non-linear tool from the "locked toolbox" that will help the GP find a simpler, more elegant solution[cite: 101, 103].
 
-    Constraints:
-    - ${function_constraint}
-    - The formula must be as simple as possible (parsimonious).
-    - Accuracy is measured by R-squared (a value between 0.0 and 1.0).
-    - You must only return a JSON object matching the requested schema.
+    LOCKED_OPERATORS: [${lockedOperators.join(', ')}]
 
-    Analyze the data and return the best formula you can find.
-    `;
+    Analyze the problem and suggest the single best tool to add.
+    You must only return a JSON object matching the requested schema.
+  `;
 
   const payload = {
     contents: [{ parts: [{ text: prompt }] }],
@@ -270,10 +271,10 @@ const callGeminiForFormula = async (dataSample, inputCols, outputCol, simpleMode
       headers: { 'Content-Type': 'application/json' },
       timeout: 30000 // 30 second timeout
     });
-   
+    
     const result = response.data;
     const json_text = result?.candidates?.[0]?.content?.parts?.[0]?.text;
-    console.log(result);
+    
     if (!json_text) {
       throw new Error("Invalid response structure from LLM.");
     }
@@ -281,10 +282,15 @@ const callGeminiForFormula = async (dataSample, inputCols, outputCol, simpleMode
     // Parse the JSON string from the LLM's text response
     const parsed_json = JSON.parse(json_text);
     
-    return {
-      formula: parsed_json.formula,
-      accuracy: parsed_json.accuracy_r_squared
-    };
+    // Validate the suggestion
+    const suggestion = parsed_json.tool_suggestion;
+    if (suggestion !== "None" && !lockedOperators.includes(suggestion)) {
+       console.warn(`LLM suggested an invalid tool: ${suggestion}. Defaulting to 'None'.`);
+       return "None";
+    }
+
+    console.log(`LLM Suggestion: Add '${suggestion}'. Reasoning: ${parsed_json.reasoning}`);
+    return suggestion; // e.g., "sqrt"
 
   } catch (error) {
     if (error.response) {
@@ -297,87 +303,129 @@ const callGeminiForFormula = async (dataSample, inputCols, outputCol, simpleMode
   }
 };
 
+/**
+ * NEW: Helper function to run the Python GP script.
+ * This is the "muscle" of the operation[cite: 39].
+ * @param {string} csvPath - Path to the temporary CSV file.
+ * @param {string} outputCol - The target output column name.
+ * @param {string[]} activeOperators - The list of operators for the GP to use.
+ * @returns {Promise<{formula: string, accuracy: number, is_bloated: boolean}>}
+ */
+const runPythonGP = async (csvPath, outputCol, activeOperators) => {
+    console.log(`Spawning Python GP... Operators: [${activeOperators.join(', ')}]`);
+    
+    // Ensure the python script path is correct
+    // Assumes evosolve_gp.py is in the same directory as index.js
+    const pythonScript = path.join(__dirname, 'evosolve_gp.py');
 
-// --- 8. Core API Endpoints (Rewritten for Mongoose) ---
+    // Configure the python-bridge
+    // This tells it where your Python executable is.
+    // Assumes 'python' or 'python3' is in your system's PATH.
+    // You might need to set a specific path, e.g., '/usr/bin/python3'
+    const py = python({ pythonPath: process.env.PYTHON_PATH || 'python3' });
+
+    try {
+        // Call the 'run_gp_analysis' function inside the Python script
+        const result = await py.import(pythonScript).run_gp_analysis(
+            csvPath,
+            outputCol,
+            activeOperators
+        );
+        
+        // The result will be a JS object automatically converted from the Python dict
+        console.log("Python GP run successful:", result);
+        return {
+            formula: result.formula,
+            accuracy: result.accuracy_score,
+            is_bloated: result.is_bloated // We need this from the Python script
+        };
+
+    } catch (error) {
+        console.error("Error running Python GP script:", error);
+        throw new Error(`GP Analysis (Python) failed: ${error.message}`);
+    }
+};
+
+
+// --- 8. Core API Endpoints (MODIFIED) ---
+
+const BASIC_OPERATORS = ['add', 'sub', 'mul', 'div'];
+const ADVANCED_OPERATORS = ['sqrt', 'log', 'sin', 'cos', 'exp'];
 
 app.get('/api/functions', (req, res) => {
   res.status(200).json({
-    basic: ['add', 'sub', 'mul', 'div'],
-    advanced: ['sqrt', 'log', 'sin', 'cos', 'exp']
+    basic: BASIC_OPERATORS,
+    advanced: ADVANCED_OPERATORS
   });
 });
 
-// POST /analyze (Protected)
+// POST /analyze (Protected, HEAVILY MODIFIED)
 app.post('/analyze', authenticateUser, upload.single('file'), async (req, res) => {
+  
+  // --- 0. Create a temporary file path for the CSV ---
+  // The Python script needs to read the file from disk.
+  const tempCsvPath = path.join(__dirname, `temp_${req.user.id}_${Date.now()}.csv`);
+
   try {
     const { output_column } = req.body;
     if (!req.file || !output_column) {
       return res.status(400).json({ detail: "File or output column missing." });
     }
     
-    // --- 1. Parse CSV (same as before) ---
-    const data = [];
-    const fileBuffer = req.file.buffer;
-    const readable = new Readable();
-    readable._read = () => {}; 
-    readable.push(fileBuffer);
-    readable.push(null);
+    // --- 1. Save CSV to a temporary file ---
+    // We must write the buffer to disk so the Python script can read it
+    await fs.promises.writeFile(tempCsvPath, req.file.buffer);
 
-    // Use a Promise to handle the stream
-    await new Promise((resolve, reject) => {
-      readable.pipe(csv())
-        .on('data', (row) => data.push(row))
-        .on('end', resolve)
-        .on('error', reject);
-    });
-
-    if (data.length === 0) {
-      return res.status(400).json({ detail: "CSV file is empty or invalid." });
-    }
-    const headers = Object.keys(data[0]);
-    if (!headers.includes(output_column)) {
-      return res.status(400).json({ detail: `Output column '${output_column}' not found.` });
-    }
-    const inputCols = headers.filter(h => h !== output_column);
-    if (inputCols.length === 0) {
-      return res.status(400).json({ detail: "No input columns found (only output column)._c" });
-    }
-    
-    // Create the data sample string for the LLM
-    const dataSample = [
-      headers.join(','), // Header row
-      ...data.slice(0, 50).map(row => headers.map(h => row[h]).join(',')) // First 50 rows
-    ].join('\n');
-
-    // --- 2. Run Metamorphic Workflow ---
-    console.log("--- Analysis Run 1: Simple Mode ---");
-    let simple_result = await callGeminiForFormula(dataSample, inputCols, output_column, true);
+    // --- 2. Run Analysis Run 1: Simple Mode (GP "Muscle") ---
+    // This run uses only basic tools [+, -, *, /][cite: 13, 97].
+    console.log("--- Analysis Run 1: Simple Mode GP ---");
+    let simple_result = await runPythonGP(tempCsvPath, output_column, BASIC_OPERATORS);
     
     let final_formula = simple_result.formula;
     let final_accuracy = simple_result.accuracy;
 
-    // 3. Check score. If it's bad, try the Metamorphic run.
-    if (final_accuracy < 0.95) {
-      console.log(`--- Simple run failed (Accuracy: ${final_accuracy}). Trying Metamorphic Mode... ---`);
-      let metamorphic_result = await callGeminiForFormula(dataSample, inputCols, output_column, false);
+    // --- 3. Check for failure (Bloat or Low Accuracy) [cite: 16, 98] ---
+    // We check for 'is_bloated' which the Python script must provide.
+    // This aligns with the PDF's logic[cite: 16].
+    if (simple_result.is_bloated || final_accuracy < 0.95) {
+      console.log(`--- Simple run failed (Accuracy: ${final_accuracy}, Bloated: ${simple_result.is_bloated}). Triggering Metamorphosis... ---`);
       
-      // Only use the new result if it's *actually* better
-      if (metamorphic_result.accuracy > final_accuracy) {
-        console.log(`--- Metamorphic run succeeded! New Accuracy: ${metamorphic_result.accuracy} ---`);
-        final_formula = metamorphic_result.formula;
-        final_accuracy = metamorphic_result.accuracy;
+      // --- 4. The "Expert Consultation" (LLM "Brain") [cite: 95, 100] ---
+      // Send the *failed* formula to the LLM for advice.
+      const tool_to_add = await callGeminiForToolSuggestion(
+          simple_result.formula, // The bloated formula [cite: 18]
+          BASIC_OPERATORS,
+          ADVANCED_OPERATORS
+      );
+
+      if (tool_to_add && tool_to_add !== "None") {
+        // --- 5. The Metamorphosis (Add the new tool) [cite: 21, 31] ---
+        const metamorphic_operators = [...BASIC_OPERATORS, tool_to_add];
+        
+        console.log(`--- Analysis Run 2: Metamorphic Mode (Operators: [${metamorphic_operators.join(', ')}]) ---`);
+        let metamorphic_result = await runPythonGP(tempCsvPath, output_column, metamorphic_operators);
+        
+        // Only use the new result if it's *actually* better
+        if (metamorphic_result.accuracy > final_accuracy) {
+          console.log(`--- Metamorphic run succeeded! New Accuracy: ${metamorphic_result.accuracy} ---`);
+          final_formula = metamorphic_result.formula;
+          final_accuracy = metamorphic_result.accuracy;
+        } else {
+          console.log("--- Metamorphic run did not improve accuracy. Keeping simple formula. ---");
+        }
       } else {
-         console.log("--- Metamorphic run did not improve accuracy. Keeping simple formula. ---");
+         console.log("--- LLM suggested 'None' or failed. Sticking with simple result. ---");
       }
+
     } else {
-      console.log(`--- Simple run sufficient (Accuracy: ${final_accuracy}) ---`);
+      console.log(`--- Simple run sufficient (Accuracy: ${final_accuracy}, Bloated: ${simple_result.is_bloated}) ---`);
     }
 
     if (!final_formula || final_accuracy === undefined) {
-      return res.status(500).json({ detail: "LLM failed to return a valid formula." });
+      return res.status(500).json({ detail: "GP/LLM failed to return a valid formula." });
     }
 
-    // --- 4. Save to Database (Mongoose Version) ---
+    // --- 6. Save to Database (Mongoose Version) ---
     const newResult = await AnalysisResult.create({
       userId: req.user.id, // req.user.id is from our auth middleware
       filename: req.file.originalname,
@@ -386,7 +434,7 @@ app.post('/analyze', authenticateUser, upload.single('file'), async (req, res) =
       accuracyScore: final_accuracy
     });
 
-    // --- 5. Return the new result ---
+    // --- 7. Return the new result ---
     res.status(201).json({
       id: newResult._id, // MongoDB uses _id
       filename: newResult.filename,
@@ -399,10 +447,20 @@ app.post('/analyze', authenticateUser, upload.single('file'), async (req, res) =
   } catch (error) {
     console.error("Analysis Error:", error);
     res.status(500).json({ detail: `Analysis failed: ${error.message}` });
+  } finally {
+    // --- 8. Cleanup: Delete the temporary file ---
+    try {
+        await fs.promises.unlink(tempCsvPath);
+        console.log("Cleaned up temporary CSV file.");
+    } catch (err) {
+        console.error("Error cleaning up temporary file:", err);
+    }
   }
 });
 
+
 // GET /history (Protected, Mongoose Version)
+// ... (This section is unchanged, so it is omitted for brevity) ...
 app.get('/history', authenticateUser, async (req, res) => {
   try {
     // Find all results for the logged-in user and sort by newest first
@@ -426,8 +484,10 @@ app.get('/history', authenticateUser, async (req, res) => {
 });
 
 
+
 // --- 9. Server Start ---
 
+// ... (This section is unchanged, so it is omitted for brevity) ...
 const startServer = async () => {
   try {
     // Connect to MongoDB using the URI from .env
